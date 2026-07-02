@@ -4,31 +4,39 @@
     screenshots the moment they land, using Claude Vision to describe the content.
 
 .DESCRIPTION
-    Step 3 of building the ShareX rename agent. Combines the FileSystemWatcher
-    trigger (step 1), the file-lock-wait logic (step 2), and the Vision API
-    rename logic from the original Invoke-ShareXRename.ps1 scheduled-task script.
-    Uncertain files are left unrenamed and logged separately for manual review.
+    Watches a ShareX screenshot folder (recursively, including subfolders created after
+    the watcher starts) using a FileSystemWatcher. Waits for each file's write lock to
+    release before processing, sends it to Claude Vision for a filename-safe description,
+    and renames it. Files the API cannot confidently describe are left unrenamed and their
+    paths are written to a separate uncertain-files log for manual review.
 
 .PARAMETER WatchPath
-    Full path to the ShareX screenshot folder to watch.
+    Full path to the ShareX screenshot root folder to watch.
 
 .PARAMETER ApiKey
-    Anthropic API key. If not supplied, reads from the ANTHROPIC_API_KEY
-    environment variable. Never hardcode this in the script.
+    Anthropic API key. If not supplied, reads from the ANTHROPIC_API_KEY environment
+    variable (process environment first, falling back to a direct registry read for
+    reliability under Scheduled Tasks). Never hardcode this in the script.
 
 .PARAMETER LockTimeoutSeconds
     Maximum time to wait for a file's write lock to release before giving up. Default 30.
 
 .EXAMPLE
     .\Watch-ShareXRename.ps1 -WatchPath "C:\Users\Marty\Pictures\ShareX"
-    Watches the real ShareX folder and renames screenshots as they arrive.
 
 .NOTES
     Author: Marty
-    Date: 2026-07-01
-    Version: 2.0
-    v2.0: Wired in Vision API rename logic. Watcher and lock-wait unchanged from v1.2.
-    Press Ctrl+C in the console to stop watching.
+    Date: 2026-07-02
+    Version: 2.2
+    v2.2: Added idempotency guard -- skips files already matching our own rename output
+          pattern, preventing a re-processing loop if a rename spuriously retriggers a
+          Created event (observed during manual testing).
+    v2.1: IncludeSubdirectories set to $True to cover ShareX's year-month subfolder
+          structure. Added registry fallback for API key read (Scheduled Task reliability).
+    v2.0: Wired in Vision API rename logic.
+    v1.2: Added Wait-FileReady lock-check logic. Write-Log refactored to Global scope.
+    v1.1: Fixed CMTrace time bias double-sign bug (was producing +-600 instead of -600).
+    Press Ctrl+C in the console to stop watching (if run interactively).
 #>
 
 [CmdletBinding()]
@@ -57,6 +65,9 @@ $ScriptStartTime = Get-Date
 
 If (-Not $ApiKey) {
     $ApiKey = $env:ANTHROPIC_API_KEY
+}
+If (-Not $ApiKey) {
+    $ApiKey = [System.Environment]::GetEnvironmentVariable("ANTHROPIC_API_KEY", "User")
 }
 If (-Not $ApiKey) {
     Throw "No Anthropic API key found. Set the ANTHROPIC_API_KEY environment variable or pass -ApiKey. Never hardcode the key in this script, especially if it lives in a public repo."
@@ -217,6 +228,9 @@ Rules:
 - Reply with ONLY the description -- no preamble, no punctuation at the end.
 - Use Title Case with spaces between words (e.g. Visual Studio Code Python Error).
 - Maximum 8 words.
+- Only name a specific application or product if you are visually certain (logo,
+  distinctive branding, or exact UI text). If inferring from layout alone, use a
+  generic term instead (e.g. Chat Application rather than guessing a specific app).
 - If you cannot determine what the screenshot depicts with reasonable confidence,
   reply with exactly the word: UNCERTAIN
 "@
@@ -336,7 +350,7 @@ Try {
     }
 
     Write-Log -Message "===== Watch-ShareXRename started. User: $env:USERNAME | Computer: $env:COMPUTERNAME | PS Version: $($PSVersionTable.PSVersion) =====" -LogFile $LogFile -Severity 1
-    Write-Log -Message "Watching folder: $WatchPath | Lock timeout: ${LockTimeoutSeconds}s" -LogFile $LogFile -Severity 1
+    Write-Log -Message "Watching folder (recursive): $WatchPath | Lock timeout: ${LockTimeoutSeconds}s" -LogFile $LogFile -Severity 1
 
     $Global:WatcherLogFile = $LogFile
     $Global:WatcherUncertainLog = $UncertainLog
@@ -357,6 +371,13 @@ Try {
 
         # Skip non-image files (e.g. our own log files being written into the same folder)
         If ($Global:SupportedExtensions -NotContains $Extension) {
+            Return
+        }
+
+        # Skip files that already match our own rename output pattern -- prevents
+        # re-processing already-renamed files if a rename operation spuriously
+        # triggers a Created event (observed during manual testing)
+        If ($FileName -match "_\d{4}-\d{2}-\d{2}(_\d+)?\.(png|jpg|jpeg|gif|webp)$") {
             Return
         }
 
